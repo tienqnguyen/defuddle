@@ -216,84 +216,20 @@ function parseTweetUrl(url: string): { username: string; tweetId: string } | nul
 
 // ─── CSS Selector Extractor ─────────────────────────────────────────────────
 
-function escapeRegex(s: string): string {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /**
- * Extract the first HTML fragment matching a simple CSS selector.
- * Supports: tag, .class, #id, and combinations (e.g. div.foo, table#main.bar).
- * Uses depth-aware walker to correctly handle nested same-tag elements.
- * Flags: 'i' (case-insensitive) + 's' (dotall, handles multiline attributes).
+ * Use linkedom's real DOM querySelector to extract a fragment.
+ * Far more reliable than regex — handles any valid CSS selector.
  */
 function extractBySelector(html: string, selector: string): string | null {
-    const token = selector.trim();
-
-    const tagMatch     = token.match(/^([a-z][a-z0-9]*)/i);
-    const idMatch      = token.match(/#([a-z][a-z0-9_-]*)/i);
-    const classMatches = [...token.matchAll(/\.([a-z][a-z0-9_-]*)/gi)];
-
-    const tag     = tagMatch ? tagMatch[1] : '[a-z][a-z0-9]*';
-    const id      = idMatch  ? idMatch[1]  : null;
-    const classes = classMatches.map(m => m[1]);
-
-    // id lookahead — handles both quote styles and surrounding attributes
-    const idLook = id
-        ? `(?=[^>]*(?:\\s|^)id=["']${escapeRegex(id)}["'])`
-        : '';
-
-    // class lookahead — each class must appear as a whole word within class="..."
-    const classLooks = classes.map(cls =>
-        `(?=[^>]*(?:\\s|^)class=["'][^"']*(?:^|\\s)${escapeRegex(cls)}(?:\\s|$)[^"']*["'])`
-    ).join('');
-
-    const openTagRe = new RegExp(
-        `<(${tag})${idLook}${classLooks}(?:\\s[^>]*)?>`,
-        'is'  // i = case-insensitive, s = dotall for multiline attributes
-    );
-
-    const startMatch = openTagRe.exec(html);
-    if (!startMatch) return null;
-
-    const matchedTag = startMatch[1].toLowerCase();
-    const startIdx   = startMatch.index;
-    let pos          = startIdx + startMatch[0].length;
-
-    // Void elements have no closing tag — return the tag itself
-    const VOID_TAGS = new Set([
-        'area', 'base', 'br', 'col', 'embed', 'hr',
-        'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr',
-    ]);
-    if (VOID_TAGS.has(matchedTag)) {
-        return html.slice(startIdx, pos);
+    try {
+        const { document } = parseHTML(html);
+        const el = document.querySelector(selector);
+        if (!el) return null;
+        return (el as any).outerHTML as string;
+    } catch {
+        return null;
     }
-
-    // Depth-aware walk to find the correct closing tag
-    let depth = 1;
-    const openRe  = new RegExp(`<${matchedTag}(?:\\s[^>]*)?>`,  'gi');
-    const closeRe = new RegExp(`<\\/${matchedTag}\\s*>`,         'gi');
-
-    while (depth > 0 && pos < html.length) {
-        openRe.lastIndex  = pos;
-        closeRe.lastIndex = pos;
-
-        const nextOpen  = openRe.exec(html);
-        const nextClose = closeRe.exec(html);
-
-        if (!nextClose) break; // malformed HTML — return what we have
-
-        if (nextOpen && nextOpen.index < nextClose.index) {
-            depth++;
-            pos = nextOpen.index + nextOpen[0].length;
-        } else {
-            depth--;
-            pos = nextClose.index + nextClose[0].length;
-        }
-    }
-
-    return html.slice(startIdx, pos);
 }
-
 // ─── DraftJS → Markdown ─────────────────────────────────────────────────────
 
 function applyInlineStyles(text: string, ranges: DraftBlock['inlineStyleRanges']): string {

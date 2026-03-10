@@ -216,9 +216,15 @@ function parseTweetUrl(url: string): { username: string; tweetId: string } | nul
 
 // ─── CSS Selector Extractor ─────────────────────────────────────────────────
 
+function escapeRegex(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
- * Extract the first HTML fragment matching a CSS selector (tag, .class, #id, combos).
- * Uses a depth-aware walker to handle nested same-tag elements correctly.
+ * Extract the first HTML fragment matching a simple CSS selector.
+ * Supports: tag, .class, #id, and combinations (e.g. div.foo, table#main.bar).
+ * Uses depth-aware walker to correctly handle nested same-tag elements.
+ * Flags: 'i' (case-insensitive) + 's' (dotall, handles multiline attributes).
  */
 function extractBySelector(html: string, selector: string): string | null {
     const token = selector.trim();
@@ -227,35 +233,46 @@ function extractBySelector(html: string, selector: string): string | null {
     const idMatch      = token.match(/#([a-z][a-z0-9_-]*)/i);
     const classMatches = [...token.matchAll(/\.([a-z][a-z0-9_-]*)/gi)];
 
-    const tag     = tagMatch    ? tagMatch[1]    : '[a-z][a-z0-9]*';
-    const id      = idMatch     ? idMatch[1]     : null;
+    const tag     = tagMatch ? tagMatch[1] : '[a-z][a-z0-9]*';
+    const id      = idMatch  ? idMatch[1]  : null;
     const classes = classMatches.map(m => m[1]);
 
+    // id lookahead — handles both quote styles and surrounding attributes
     const idLook = id
-        ? `(?=[^>]*\\bid="${id}"[^>]*)`
+        ? `(?=[^>]*(?:\\s|^)id=["']${escapeRegex(id)}["'])`
         : '';
 
-    const classLooks = classes
-        .map(cls => `(?=[^>]*\\bclass="[^"]*(?:^|\\s)${cls}(?:\\s|$)[^"]*")`)
-        .join('');
+    // class lookahead — each class must appear as a whole word within class="..."
+    const classLooks = classes.map(cls =>
+        `(?=[^>]*(?:\\s|^)class=["'][^"']*(?:^|\\s)${escapeRegex(cls)}(?:\\s|$)[^"']*["'])`
+    ).join('');
 
-    const openTagPattern = new RegExp(
-        `<(${tag})${idLook}${classLooks}[^>]*>`,
-        'i'
+    const openTagRe = new RegExp(
+        `<(${tag})${idLook}${classLooks}(?:\\s[^>]*)?>`,
+        'is'  // i = case-insensitive, s = dotall for multiline attributes
     );
 
-    const startMatch = openTagPattern.exec(html);
+    const startMatch = openTagRe.exec(html);
     if (!startMatch) return null;
 
-    const matchedTag = startMatch[1];
+    const matchedTag = startMatch[1].toLowerCase();
     const startIdx   = startMatch.index;
     let pos          = startIdx + startMatch[0].length;
-    let depth        = 1;
 
-    const openRe  = new RegExp(`<${matchedTag}[^>]*>`,  'gi');
-    const closeRe = new RegExp(`<\\/${matchedTag}\\s*>`, 'gi');
+    // Void elements have no closing tag — return the tag itself
+    const VOID_TAGS = new Set([
+        'area', 'base', 'br', 'col', 'embed', 'hr',
+        'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr',
+    ]);
+    if (VOID_TAGS.has(matchedTag)) {
+        return html.slice(startIdx, pos);
+    }
 
-    // Walk forward tracking nesting depth to find the correct closing tag
+    // Depth-aware walk to find the correct closing tag
+    let depth = 1;
+    const openRe  = new RegExp(`<${matchedTag}(?:\\s[^>]*)?>`,  'gi');
+    const closeRe = new RegExp(`<\\/${matchedTag}\\s*>`,         'gi');
+
     while (depth > 0 && pos < html.length) {
         openRe.lastIndex  = pos;
         closeRe.lastIndex = pos;
@@ -263,7 +280,7 @@ function extractBySelector(html: string, selector: string): string | null {
         const nextOpen  = openRe.exec(html);
         const nextClose = closeRe.exec(html);
 
-        if (!nextClose) break; // malformed HTML, return what we have
+        if (!nextClose) break; // malformed HTML — return what we have
 
         if (nextOpen && nextOpen.index < nextClose.index) {
             depth++;
@@ -289,13 +306,13 @@ function applyInlineStyles(text: string, ranges: DraftBlock['inlineStyleRanges']
         const after   = result.slice(range.offset + range.length);
         switch (range.style) {
             case 'Bold':
-            case 'BOLD':        result = before + `**${segment}**` + after; break;
+            case 'BOLD':          result = before + `**${segment}**`  + after; break;
             case 'Italic':
-            case 'ITALIC':      result = before + `*${segment}*`   + after; break;
+            case 'ITALIC':        result = before + `*${segment}*`    + after; break;
             case 'Code':
-            case 'CODE':        result = before + `\`${segment}\`` + after; break;
+            case 'CODE':          result = before + `\`${segment}\``  + after; break;
             case 'Strikethrough':
-            case 'STRIKETHROUGH': result = before + `~~${segment}~~` + after; break;
+            case 'STRIKETHROUGH': result = before + `~~${segment}~~`  + after; break;
         }
     }
     return result;
@@ -346,8 +363,8 @@ function resolveArticleMediaUrl(
     }
     if (info.__typename === 'ApiVideo' || info.video_info) {
         const variants = info.video_info?.variants || [];
-        const mp4s = variants.filter(v => v.content_type === 'video/mp4' && v.url);
-        const best = mp4s.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+        const mp4s     = variants.filter(v => v.content_type === 'video/mp4' && v.url);
+        const best     = mp4s.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
         if (best?.url) return { url: best.url, type: 'video' };
         const any = variants.find(v => v.url);
         if (any?.url) return { url: any.url, type: 'video' };
@@ -365,13 +382,13 @@ function blocksToMarkdown(
         let text = applyEntityLinks(block.text || '', block.entityRanges || [], entityMap);
         text = applyInlineStyles(text, block.inlineStyleRanges || []);
         switch (block.type) {
-            case 'header-one':             lines.push(`# ${text}`);   break;
-            case 'header-two':             lines.push(`## ${text}`);  break;
-            case 'header-three':           lines.push(`### ${text}`); break;
-            case 'unordered-list-item':    lines.push(`- ${text}`);   break;
-            case 'ordered-list-item':      lines.push(`1. ${text}`);  break;
-            case 'blockquote':             lines.push(`> ${text}`);   break;
-            case 'code-block':             lines.push('```\n' + block.text + '\n```'); break;
+            case 'header-one':          lines.push(`# ${text}`);   break;
+            case 'header-two':          lines.push(`## ${text}`);  break;
+            case 'header-three':        lines.push(`### ${text}`); break;
+            case 'unordered-list-item': lines.push(`- ${text}`);   break;
+            case 'ordered-list-item':   lines.push(`1. ${text}`);  break;
+            case 'blockquote':          lines.push(`> ${text}`);   break;
+            case 'code-block':          lines.push('```\n' + block.text + '\n```'); break;
             case 'atomic': {
                 for (const range of block.entityRanges || []) {
                     const entity = entityMap[range.key];
@@ -474,7 +491,7 @@ function renderMedia(media: FxTweet['media'], indent = ''): string {
         parts.push(`${indent}[External Video](${media.external.url})`);
     }
     if (media.broadcast) {
-        const bc = media.broadcast;
+        const bc         = media.broadcast;
         const stateLabel = bc.state === 'LIVE' ? '🔴 LIVE' : '⏹ Ended';
         parts.push(`${indent}**${stateLabel}: ${bc.title}** by @${bc.broadcaster.username}`);
         parts.push(bc.stream?.url
@@ -499,13 +516,13 @@ function formatDuration(seconds: number): string {
 // ─── Quote / Poll / Engagement ──────────────────────────────────────────────
 
 function renderQuote(quote: FxTweet): string {
-    const qAuthor  = quote.author?.name || '';
-    const qHandle  = quote.author?.screen_name || '';
-    const qUrl     = quote.url || `https://x.com/${qHandle}/status/${quote.id}`;
-    let content    = `> **${qAuthor}** ([@${qHandle}](https://x.com/${qHandle})):`;
-    const qText    = expandTweetText(quote);
+    const qAuthor = quote.author?.name || '';
+    const qHandle = quote.author?.screen_name || '';
+    const qUrl    = quote.url || `https://x.com/${qHandle}/status/${quote.id}`;
+    let content   = `> **${qAuthor}** ([@${qHandle}](https://x.com/${qHandle})):`;
+    const qText   = expandTweetText(quote);
     if (qText) content += '\n> \n' + qText.split('\n').map(l => `> ${l}`).join('\n');
-    const qMedia   = renderMedia(quote.media, '> ');
+    const qMedia  = renderMedia(quote.media, '> ');
     if (qMedia) content += qMedia;
     content += `\n>\n> [View original](${qUrl})`;
     return content;
@@ -525,10 +542,10 @@ function renderPoll(poll: FxPoll): string {
 
 function renderEngagement(tweet: FxTweet): string {
     const parts: string[] = [];
-    if (tweet.likes    != null) parts.push(`❤️ ${tweet.likes.toLocaleString()}`);
-    if (tweet.retweets != null) parts.push(`🔁 ${tweet.retweets.toLocaleString()}`);
-    if (tweet.replies  != null) parts.push(`💬 ${tweet.replies.toLocaleString()}`);
-    if (tweet.views    != null) parts.push(`👁 ${tweet.views.toLocaleString()}`);
+    if (tweet.likes     != null) parts.push(`❤️ ${tweet.likes.toLocaleString()}`);
+    if (tweet.retweets  != null) parts.push(`🔁 ${tweet.retweets.toLocaleString()}`);
+    if (tweet.replies   != null) parts.push(`💬 ${tweet.replies.toLocaleString()}`);
+    if (tweet.views     != null) parts.push(`👁 ${tweet.views.toLocaleString()}`);
     if (tweet.bookmarks != null) parts.push(`🔖 ${tweet.bookmarks.toLocaleString()}`);
     return parts.length ? '\n\n---\n' + parts.join(' · ') : '';
 }
@@ -558,10 +575,10 @@ async function fetchTweetData(url: string): Promise<ConvertResult> {
     }
 
     if (tweet.article?.content?.blocks) {
-        const article  = tweet.article;
-        title          = article.title || '';
-        description    = article.preview_text || '';
-        const coverUrl = article.cover_media?.media_info?.original_img_url || article.cover_media?.url;
+        const article       = tweet.article;
+        title               = article.title || '';
+        description         = article.preview_text || '';
+        const coverUrl      = article.cover_media?.media_info?.original_img_url || article.cover_media?.url;
         if (coverUrl) content += `![Cover](${coverUrl})\n\n`;
 
         const blocks        = article.content.blocks;
@@ -582,13 +599,12 @@ async function fetchTweetData(url: string): Promise<ConvertResult> {
         content += blocksToMarkdown(blocks, entityMap, mediaEntities);
     } else {
         content     = expandTweetText(tweet);
-        title       = '';
         description = (tweet.text || '').slice(0, 200);
     }
 
     content += renderMedia(tweet.media);
-    if (tweet.quote)           content += '\n\n' + renderQuote(tweet.quote);
-    if (tweet.poll)            content += renderPoll(tweet.poll);
+    if (tweet.quote) content += '\n\n' + renderQuote(tweet.quote);
+    if (tweet.poll)  content += renderPoll(tweet.poll);
     if (tweet.community_note?.text) {
         content += '\n\n> [!NOTE] **Community Note**\n> '
             + tweet.community_note.text.split('\n').join('\n> ');
@@ -630,7 +646,7 @@ async function fetchAndParse(
             signal: controller.signal,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (compatible; DefuddleWorker/1.0)',
-                'Accept': 'text/html,application/xhtml+xml',
+                'Accept':     'text/html,application/xhtml+xml',
             },
             redirect: 'follow',
         });
@@ -652,20 +668,41 @@ async function fetchAndParse(
         throw new Error(`Page too large (${Math.round(parseInt(contentLength) / 1024 / 1024)}MB, max 5MB)`);
     }
 
-    let html = await response.text();
+    const html = await response.text();
     if (html.length > MAX_SIZE) {
         throw new Error(`Page too large (${Math.round(html.length / 1024 / 1024)}MB, max 5MB)`);
     }
 
-    // ── Selector: extract fragment BEFORE passing to Defuddle ────────────────
+    // ── Selector path: extract fragment → Turndown directly (skip Defuddle) ──
     if (selector) {
         const fragment = extractBySelector(html, selector);
         if (!fragment) {
             throw new Error(`Selector "${selector}" matched no elements.`);
         }
-        html = `<!DOCTYPE html><html><body>${fragment}</body></html>`;
+
+        const turndown = new TurndownService({
+            headingStyle:   'atx',
+            codeBlockStyle: 'fenced',
+        });
+        const markdown = turndown.turndown(fragment);
+
+        const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+        const pageTitle  = titleMatch ? titleMatch[1].trim() : '';
+        const domain     = new URL(targetUrl).hostname.replace(/^www\./, '');
+
+        return {
+            title:       pageTitle,
+            author:      '',
+            published:   '',
+            description: '',
+            domain,
+            content:     markdown,
+            wordCount:   markdown.split(/\s+/).filter(Boolean).length,
+            source:      targetUrl,
+        };
     }
 
+    // ── Full page path: Defuddle → Turndown ──────────────────────────────────
     const { document } = parseHTML(html);
 
     const doc = document as any;
